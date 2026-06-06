@@ -16,15 +16,11 @@ asyncxy v2 — 透明反向代理（FastAPI + curl_cffi AsyncSession）。
 """
 import os
 import json
-import logging
 
 from fastapi import FastAPI, Request
 from fastapi.responses import Response, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from curl_cffi.requests import AsyncSession
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-logger = logging.getLogger("asyncxy")
 
 # 最大请求体 10MB
 MAX_BODY_SIZE = 10 * 1024 * 1024
@@ -136,7 +132,6 @@ async def proxy(request: Request, path: str):
             )
 
     except Exception as e:
-        logger.warning("代理请求失败: %s %s -> %s: %s", method, target_url, type(e).__name__, e)
         return Response(
             content=f"{type(e).__name__}: {e}",
             status_code=502,
