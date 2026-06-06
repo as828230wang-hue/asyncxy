@@ -1,119 +1,93 @@
 # asyncxy
 
-通用反向代理服务。部署后前端可通过单一接口转发任意 HTTP 请求，解决跨域、Cookie 透传、代理 IP 出站等问题。
+通用透明反向代理。前端 fetch 调用目标 URL 时只需在前面加代理前缀，method/headers/body 原样透传。
 
 ## 特性
 
-- 支持所有 HTTP 方法（GET/POST/PUT/DELETE/PATCH）
-- 动态目标 URL（前端指定）
-- 代理 IP 出站（HTTP/HTTPS/SOCKS5）
-- Cookie 透传（前端管理生命周期，代理负责携带）
-- TLS 指纹模拟 Chrome（基于 curl_cffi）
-- CORS 全开放，任意前端域可调用
+- 透明代理：`/proxy/{目标URL}` 即可转发任意请求
+- Chrome TLS 指纹模拟（curl_cffi impersonate）
+- Cookie 双向透传（`X-Proxy-Cookie` 传入，`X-Cookie-Jar` 返回）
+- 代理 IP 出站（`X-Proxy-Upstream` 指定 HTTP/HTTPS/SOCKS5 代理）
+- 可配置超时（`X-Proxy-Timeout`，默认 30 秒，范围 5-120）
+- CORS 全开放
+- 无状态，无业务逻辑，通用于任何前端项目
+- FastAPI + uvicorn 高并发
 
 ## 部署到 Render
 
-1. Fork 或导入此仓库到你的 GitHub
-2. 打开 https://dashboard.render.com/
-3. **New** → **Web Service** → 选择此仓库
-4. 配置：
+1. 导入此仓库到 Render
+2. 选择 **Web Service** → 连接此 GitHub 仓库
+3. 配置：
    - Name: `asyncxy`
    - Branch: `main`
    - Runtime: `Python 3`
    - Build Command: `pip install -r requirements.txt`
-   - Start Command: `python app.py`
+   - Start Command: `uvicorn app:app --host 0.0.0.0 --port $PORT`
    - Instance Type: Free
-5. 点击 **Create Web Service**
-
-部署完成后地址类似：`https://asyncxy.onrender.com`
+4. 部署完成后地址：`https://asyncxy.onrender.com`
 
 ## API
 
 ### 健康检查
 
 ```
-GET /health
-→ {"status": "ok"}
+GET /health → {"status": "ok", "version": "2.0"}
 ```
 
 ### 代理请求
 
 ```
-POST /proxy
-Content-Type: application/json
+{任意方法} /proxy/{目标完整URL}
 ```
 
-**请求体：**
+#### 自定义 Headers（代理控制）
 
-| 字段 | 类型 | 必填 | 说明 |
-|------|------|------|------|
-| url | string | ✅ | 目标 URL |
-| method | string | ❌ | HTTP 方法，默认 GET |
-| headers | object | ❌ | 请求头 |
-| body | string | ❌ | 请求体 |
-| proxy | string | ❌ | 代理地址，如 `http://user:pass@ip:port` 或 `socks5://ip:port` |
-| cookies | object | ❌ | Cookie 字典，会被合并到请求 Cookie header |
-| timeout | number | ❌ | 超时秒数，默认 30 |
+| Header | 说明 | 示例 |
+|--------|------|------|
+| `X-Proxy-Cookie` | 要携带给目标的 Cookie | `JSESSIONID=xxx; shard=yyy` |
+| `X-Proxy-Upstream` | 上游代理地址 | `http://user:pass@ip:port` |
+| `X-Proxy-Timeout` | 超时秒数（5-120） | `30` |
 
-**响应体：**
+#### 响应 Headers
 
-```json
-{
-  "ok": true,
-  "status": 200,
-  "headers": {"content-type": "application/json", ...},
-  "set_cookies": ["JSESSIONID=xxx; Path=/; HttpOnly", ...],
-  "cookies": {"JSESSIONID": "xxx", ...},
-  "body": "响应体字符串"
-}
-```
+| Header | 说明 |
+|--------|------|
+| `X-Cookie-Jar` | 目标返回的所有 cookie（`k=v; k2=v2` 格式） |
+| `X-Set-Cookie` | 原始 Set-Cookie 数组（JSON） |
 
 ## 使用示例
 
 ### 基础请求
 
 ```javascript
-const resp = await fetch('https://asyncxy.onrender.com/proxy', {
-  method: 'POST',
-  headers: { 'Content-Type': 'application/json' },
-  body: JSON.stringify({
-    url: 'https://httpbin.org/get',
-    method: 'GET',
-  })
-});
+const resp = await fetch('https://asyncxy.onrender.com/proxy/https://example.com/api/data');
 const data = await resp.json();
-console.log(data.body);
 ```
 
-### 带 Cookie 的多步请求（如登录后操作）
+### 带 Cookie 的多步请求
 
 ```javascript
-// 第一步：登录，获取 cookies
-const login = await proxyFetch({
-  url: 'https://example.com/api/login',
+// 1. 登录
+const r1 = await fetch('/proxy/https://target.com/login', {
   method: 'POST',
-  headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-  body: 'user=xxx&pass=xxx',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({ user: 'xxx', pass: 'xxx' }),
 });
-const { cookies } = login;
+const cookies = r1.headers.get('x-cookie-jar');
 
-// 第二步：带 cookies 访问需要认证的接口
-const result = await proxyFetch({
-  url: 'https://example.com/api/data',
-  method: 'GET',
-  cookies,  // 把第一步返回的 cookies 传入
+// 2. 带 cookie 请求
+const r2 = await fetch('/proxy/https://target.com/api/data', {
+  headers: { 'X-Proxy-Cookie': cookies },
 });
 ```
 
 ### 通过代理 IP 出站
 
 ```javascript
-const resp = await proxyFetch({
-  url: 'https://target.com/api',
-  method: 'POST',
-  headers: { 'Content-Type': 'application/json' },
-  body: JSON.stringify({ key: 'value' }),
-  proxy: 'socks5://user:pass@proxy-ip:1080',
+fetch('/proxy/https://target.com/api', {
+  headers: {
+    'X-Proxy-Upstream': 'http://user:pass@proxy-ip:port',
+  },
 });
 ```
 
@@ -122,11 +96,11 @@ const resp = await proxyFetch({
 ```bash
 pip install -r requirements.txt
 python app.py
-# 默认监听 http://localhost:8080
+# 监听 http://localhost:8080
 ```
 
-## 注意事项
+## 技术栈
 
-- Render 免费版实例 15 分钟无请求会休眠，首次唤醒约 30 秒
-- 不要用于传输敏感凭据到不受信任的代理服务器
-- `curl_cffi` 模拟 Chrome TLS 指纹，可绕过部分 bot 检测
+- **FastAPI** — ASGI Web 框架
+- **uvicorn** — ASGI 服务器
+- **curl_cffi** — HTTP 客户端（Chrome TLS 指纹模拟）

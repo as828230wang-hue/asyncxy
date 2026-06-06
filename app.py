@@ -1,156 +1,151 @@
 # coding: utf-8
 """
-通用反向代理服务。部署于 Render。
-前端发 POST /proxy，服务端转发到目标 URL 并返回完整响应。
+asyncxy v2 — 透明反向代理（FastAPI + curl_cffi AsyncSession）。
 
-支持：
-  - 所有 HTTP 方法（GET/POST/PUT/DELETE/PATCH/HEAD/OPTIONS）
-  - 自定义请求 headers
-  - 自定义请求 body（字符串或 JSON）
-  - 代理 IP（HTTP/HTTPS/SOCKS5）
-  - Cookie 透传（前端手动管理 cookie 生命周期）
-  - 返回响应 headers（含 Set-Cookie 原文）
+用法：
+  请求: {METHOD} /proxy/{目标URL}
+  示例: POST /proxy/https://mail.ziggo.nl/ajax/login?action=login
 
-请求格式：
-  POST /proxy
-  Content-Type: application/json
-  {
-    "url": "https://target.com/api/xxx",
-    "method": "POST",                    // 可选，默认 GET
-    "headers": {"Content-Type": "..."},  // 可选
-    "body": "...",                        // 可选，字符串
-    "proxy": "http://user:pass@ip:port", // 可选
-    "cookies": {"name": "value", ...},   // 可选，上次响应返回的 cookies
-    "timeout": 30                        // 可选，默认 30 秒
-  }
-
-响应格式：
-  {
-    "ok": true,
-    "status": 200,
-    "headers": {"content-type": "...", ...},
-    "set_cookies": ["JSESSIONID=xxx; Path=/; HttpOnly", ...],
-    "cookies": {"JSESSIONID": "xxx", ...},
-    "body": "响应体字符串"
-  }
+特性：
+  - /proxy/ 后面即目标地址，method/headers/body 原样透传
+  - Cookie 透传：前端通过 X-Proxy-Cookie header 传入
+  - Cookie 回传：通过 X-Cookie-Jar header 返回给前端
+  - 代理 IP：通过 X-Proxy-Upstream header 指定（http/https/socks5）
+  - CORS 全开放
+  - curl_cffi AsyncSession 提供 Chrome TLS 指纹模拟
 """
 import os
 import json
-from http.cookies import SimpleCookie
-from typing import Optional
+import logging
 
-from aiohttp import web
+from fastapi import FastAPI, Request
+from fastapi.responses import Response, JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
 from curl_cffi.requests import AsyncSession
 
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger("asyncxy")
 
-async def handle_proxy(request: web.Request) -> web.Response:
-    """通用代理入口"""
+# 最大请求体 10MB
+MAX_BODY_SIZE = 10 * 1024 * 1024
+
+app = FastAPI(title="asyncxy", version="2.0.0", docs_url=None, redoc_url=None)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+    expose_headers=["X-Set-Cookie", "X-Cookie-Jar"],
+)
+
+# 代理内部 header，不转发给目标
+STRIP_REQ_HEADERS = frozenset({
+    "host", "x-proxy-cookie", "x-proxy-upstream", "x-proxy-timeout",
+    "origin", "referer", "connection", "accept-encoding",
+    "content-length", "transfer-encoding",
+})
+
+
+@app.get("/health")
+async def health():
+    """健康检查"""
+    return {"status": "ok", "version": "2.0"}
+
+
+@app.api_route(
+    "/proxy/{path:path}",
+    methods=["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"],
+)
+async def proxy(request: Request, path: str):
+    """透明代理入口：/proxy/{目标完整URL}"""
+
+    # ── 1. 解析目标 URL ──
+    target_url = path
+    query = request.url.query
+    if query:
+        target_url += "?" + (query if isinstance(query, str) else query.decode())
+    if not target_url.startswith(("http://", "https://")):
+        return Response("Target URL must start with http:// or https://", status_code=400)
+
+    method = request.method
+
+    # ── 2. 构造转发 headers ──
+    fwd_headers: dict[str, str] = {}
+    for k, v in request.headers.items():
+        if k.lower() not in STRIP_REQ_HEADERS:
+            fwd_headers[k] = v
+
+    # Cookie 透传：X-Proxy-Cookie → Cookie
+    proxy_cookie = request.headers.get("x-proxy-cookie")
+    if proxy_cookie:
+        fwd_headers["cookie"] = proxy_cookie
+
+    # ── 3. 代理 IP ──
+    upstream = request.headers.get("x-proxy-upstream") or None
+
+    # ── 4. 超时 ──
     try:
-        data = await request.json()
-    except json.JSONDecodeError:
-        return web.json_response({"ok": False, "error": "无效的 JSON"}, status=400)
+        timeout = int(request.headers.get("x-proxy-timeout", "30"))
+    except (ValueError, TypeError):
+        timeout = 30
+    timeout = max(5, min(timeout, 120))  # 限制 5~120 秒
 
-    url: str = data.get("url", "").strip()
-    if not url:
-        return web.json_response({"ok": False, "error": "缺少 url 参数"}, status=400)
+    # ── 5. 读取请求体 ──
+    body = await request.body()
+    if len(body) > MAX_BODY_SIZE:
+        return Response("Request body too large", status_code=413)
+    if not body:
+        body = None
 
-    method: str = data.get("method", "GET").upper()
-    headers: dict = data.get("headers") or {}
-    body: Optional[str] = data.get("body")
-    proxy: Optional[str] = data.get("proxy")
-    cookies: Optional[dict] = data.get("cookies")
-    timeout: int = data.get("timeout", 30)
-
-    # 如果前端传了 cookies，构造 Cookie header
-    if cookies and isinstance(cookies, dict):
-        cookie_str = "; ".join(f"{k}={v}" for k, v in cookies.items())
-        # 合并到 headers（如果已有 Cookie header 则追加）
-        existing = headers.get("Cookie", "")
-        headers["Cookie"] = (existing + "; " + cookie_str).strip("; ")
-
+    # ── 6. 转发请求 ──
     try:
-        async with AsyncSession(
-            impersonate="chrome",
-            proxy=proxy if proxy else None,
-            timeout=timeout,
-        ) as session:
+        async with AsyncSession(impersonate="chrome", proxy=upstream, timeout=timeout) as session:
             resp = await session.request(
                 method=method,
-                url=url,
-                headers=headers if headers else None,
-                data=body.encode("utf-8") if body else None,
+                url=target_url,
+                headers=fwd_headers if fwd_headers else None,
+                data=body,
             )
 
-            # 解析响应 headers
-            resp_headers = dict(resp.headers)
+            # ── 7. 构造响应 ──
+            resp_headers: dict[str, str] = {}
 
-            # 提取 Set-Cookie（可能多个）
-            set_cookie_list = resp.headers.get_list("set-cookie") if hasattr(resp.headers, "get_list") else []
+            # 回传 cookie 字典（前端直接可用）
+            if session.cookies:
+                resp_headers["X-Cookie-Jar"] = "; ".join(
+                    f"{k}={v}" for k, v in session.cookies.items()
+                )
 
-            # 解析 cookies 为简单字典
-            parsed_cookies = dict(session.cookies)
+            # 回传原始 Set-Cookie（供调试或高级用途）
+            set_cookies = (
+                resp.headers.get_list("set-cookie")
+                if hasattr(resp.headers, "get_list")
+                else []
+            )
+            if set_cookies:
+                resp_headers["X-Set-Cookie"] = json.dumps(set_cookies)
 
-            # 响应体
-            try:
-                resp_body = resp.text
-            except Exception:
-                resp_body = resp.content.decode("utf-8", errors="replace")
+            content_type = resp.headers.get("content-type", "application/octet-stream")
 
-            return web.json_response({
-                "ok": True,
-                "status": resp.status_code,
-                "headers": resp_headers,
-                "set_cookies": set_cookie_list,
-                "cookies": parsed_cookies,
-                "body": resp_body,
-            })
+            return Response(
+                content=resp.content,
+                status_code=resp.status_code,
+                headers=resp_headers,
+                media_type=content_type,
+            )
 
     except Exception as e:
-        return web.json_response({
-            "ok": False,
-            "error": f"{type(e).__name__}: {str(e)}",
-        }, status=502)
-
-
-async def handle_health(request: web.Request) -> web.Response:
-    """健康检查"""
-    return web.json_response({"status": "ok"})
-
-
-async def handle_cors_preflight(request: web.Request) -> web.Response:
-    """处理 CORS 预检"""
-    return web.Response(
-        status=204,
-        headers={
-            "Access-Control-Allow-Origin": "*",
-            "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, PATCH, OPTIONS",
-            "Access-Control-Allow-Headers": "Content-Type, Authorization",
-            "Access-Control-Max-Age": "86400",
-        },
-    )
-
-
-@web.middleware
-async def cors_middleware(request: web.Request, handler):
-    """CORS 中间件，允许所有来源"""
-    if request.method == "OPTIONS":
-        return await handle_cors_preflight(request)
-    response = await handler(request)
-    response.headers["Access-Control-Allow-Origin"] = "*"
-    response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, PATCH, OPTIONS"
-    response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
-    return response
-
-
-def create_app() -> web.Application:
-    app = web.Application(middlewares=[cors_middleware])
-    app.router.add_post("/proxy", handle_proxy)
-    app.router.add_get("/health", handle_health)
-    app.router.add_options("/proxy", handle_cors_preflight)
-    return app
+        logger.warning("代理请求失败: %s %s -> %s: %s", method, target_url, type(e).__name__, e)
+        return Response(
+            content=f"{type(e).__name__}: {e}",
+            status_code=502,
+            media_type="text/plain",
+        )
 
 
 if __name__ == "__main__":
+    import uvicorn
+
     port = int(os.environ.get("PORT", 8080))
-    print(f"代理服务启动于端口 {port}")
-    web.run_app(create_app(), host="0.0.0.0", port=port)
+    uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
