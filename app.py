@@ -16,6 +16,7 @@ asyncxy v2 — 透明反向代理（FastAPI + curl_cffi AsyncSession）。
 """
 import os
 import json
+from urllib.parse import unquote
 
 from fastapi import FastAPI, Request
 from fastapi.responses import Response, JSONResponse
@@ -57,7 +58,7 @@ async def proxy(request: Request, path: str):
     """透明代理入口：/proxy/{目标完整URL}"""
 
     # ── 1. 解析目标 URL ──
-    target_url = path
+    target_url = unquote(path)
     query = request.url.query
     if query:
         target_url += "?" + (query if isinstance(query, str) else query.decode())
