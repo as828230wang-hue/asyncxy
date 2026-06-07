@@ -72,10 +72,15 @@ async def proxy(request: Request, path: str):
         if k.lower() not in STRIP_REQ_HEADERS:
             fwd_headers[k] = v
 
-    # Cookie 透传：X-Proxy-Cookie → Cookie
+    # Cookie 透传：X-Proxy-Cookie → 解析为字典传入 curl_cffi cookies 参数
     proxy_cookie = request.headers.get("x-proxy-cookie")
+    cookie_dict: dict[str, str] = {}
     if proxy_cookie:
-        fwd_headers["cookie"] = proxy_cookie
+        for pair in proxy_cookie.split(";"):
+            pair = pair.strip()
+            if "=" in pair:
+                k, v = pair.split("=", 1)
+                cookie_dict[k.strip()] = v.strip()
 
     # ── 3. 代理 IP ──
     upstream = request.headers.get("x-proxy-upstream") or None
@@ -101,6 +106,7 @@ async def proxy(request: Request, path: str):
                 method=method,
                 url=target_url,
                 headers=fwd_headers if fwd_headers else None,
+                cookies=cookie_dict if cookie_dict else None,
                 data=body,
             )
 
