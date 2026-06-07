@@ -16,6 +16,7 @@ asyncxy v2 — 透明反向代理（FastAPI + curl_cffi AsyncSession）。
 """
 import os
 import json
+import time
 from urllib.parse import unquote
 
 from fastapi import FastAPI, Request
@@ -47,7 +48,82 @@ STRIP_REQ_HEADERS = frozenset({
 @app.get("/health")
 async def health():
     """健康检查"""
-    return {"status": "ok", "version": "2.0"}
+    return {"status": "ok", "version": "2.1"}
+
+
+@app.post("/send")
+async def send_mail(request: Request):
+    """
+    邮件发送端点：在同一个 Session 中完成 login + compose + send。
+    解决代理模式下独立 Session 导致 OX session 绑定失效的问题。
+
+    请求体 JSON:
+    {
+      "host": "https://kpc.webmail.kpnmail.nl",  // 或 https://mail.ziggo.nl
+      "email": "user@kpnmail.nl",
+      "password": "xxx",
+      "to": [["Name", "email@example.com"]],
+      "from": ["Display Name", "sender@kpnmail.nl"],
+      "subject": "Hello",
+      "content": "<p>HTML body</p>",
+      "proxy": "http://user:pass@host:port"  // 可选
+    }
+    """
+    try:
+        data = await request.json()
+    except Exception:
+        return JSONResponse({"ok": False, "error": "Invalid JSON"}, status_code=400)
+
+    host = data.get("host", "").rstrip("/")
+    email = data.get("email", "")
+    password = data.get("password", "")
+    to_list = data.get("to", [])
+    from_field = data.get("from", [email.split("@")[0], email])
+    subject = data.get("subject", "")
+    content = data.get("content", "")
+    proxy = data.get("proxy") or None
+
+    if not host or not email or not password or not to_list:
+        return JSONResponse({"ok": False, "error": "Missing required fields"}, status_code=400)
+
+    login_url = f"{host}/ajax/login?action=login"
+    compose_url = f"{host}/appsuite/api/mail/compose"
+
+    try:
+        async with AsyncSession(impersonate="chrome", proxy=proxy, timeout=30) as s:
+            # 1. 登录
+            r1 = await s.post(login_url, headers={"Content-Type": "application/x-www-form-urlencoded"},
+                              data=f"name={email}&password={password}&client=open-xchange-appsuite&version=7.10.3&clientToken=send1&jsonResponse=true")
+            d1 = r1.json()
+            session_id = d1.get("session")
+            if not session_id:
+                return JSONResponse({"ok": False, "error": d1.get("error", "Login failed"), "code": d1.get("code", "")})
+
+            # 2. 创建草稿
+            claim = "USQ" + str(int(time.time() * 1000))
+            r2 = await s.post(f"{compose_url}?type=new&vcard=false&sharedAttachmentsEnabled=false&claim={claim}&session={session_id}",
+                              headers={"Content-Type": "application/json"}, data="{}")
+            d2 = r2.json()
+            draft_id = d2.get("data", {}).get("id")
+            if not draft_id:
+                return JSONResponse({"ok": False, "error": "Draft creation failed: " + d2.get("error", "")})
+
+            # 3. 填内容
+            mail_json = json.dumps({"from": from_field, "to": to_list, "subject": subject, "contentType": "text/html", "content": content})
+            await s.put(f"{compose_url}/{draft_id}?clientToken={claim}&session={session_id}",
+                        headers={"Content-Type": "application/json"}, data=mail_json)
+
+            # 4. 发送
+            r4 = await s.post(f"{compose_url}/{draft_id}/send?clientToken={claim}&session={session_id}",
+                              headers={"Content-Type": "application/json"}, data="{}")
+            d4 = r4.json()
+            if d4.get("error"):
+                return JSONResponse({"ok": False, "error": d4["error"]})
+
+            return JSONResponse({"ok": True, "data": d4.get("data")})
+
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": f"{type(e).__name__}: {e}"}, status_code=502)
 
 
 @app.api_route(
