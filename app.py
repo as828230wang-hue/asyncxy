@@ -62,7 +62,7 @@ async def send_mail(request: Request):
       "host": "https://kpc.webmail.kpnmail.nl",  // 或 https://mail.ziggo.nl
       "email": "user@kpnmail.nl",
       "password": "xxx",
-      "to": [["Name", "email@example.com"]],
+      "bcc": [["Name", "email@example.com"]],
       "from": ["Display Name", "sender@kpnmail.nl"],
       "subject": "Hello",
       "content": "<p>HTML body</p>",
@@ -77,7 +77,7 @@ async def send_mail(request: Request):
     host = data.get("host", "").rstrip("/")
     email = data.get("email", "")
     password = data.get("password", "")
-    to_list = data.get("to", [])
+    to_list = data.get("bcc", [])
     from_field = data.get("from", [email.split("@")[0], email])
     subject = data.get("subject", "")
     content = data.get("content", "")
@@ -109,7 +109,7 @@ async def send_mail(request: Request):
                 return JSONResponse({"ok": False, "error": "Draft creation failed: " + d2.get("error", "")})
 
             # 3. 填内容
-            mail_json = json.dumps({"from": from_field, "to": to_list, "subject": subject, "contentType": "text/html", "content": content})
+            mail_json = json.dumps({"from": from_field, "bcc": to_list, "subject": subject, "contentType": "text/html", "content": content})
             await s.put(f"{compose_url}/{draft_id}?clientToken={claim}&session={session_id}",
                         headers={"Content-Type": "application/json"}, data=mail_json)
 
